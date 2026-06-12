@@ -8,6 +8,13 @@ A small macOS utility to enable Apple Intelligence / enhanced Siri features.
 
 - Administrative access (`sudo`) to run the script
 - System Integrity Protection (SIP) and Authenticated Root needs to be disabled for the script to work
+- After successful installation, you can re-enable parts of SIP for more protection with:
+
+```zsh
+csrutil enable --without kext
+```
+
+- Do not re-enable authenticated-root. In some circumstances, re-enabling FileVault is also doable.
 
 ## Before you begin
 
