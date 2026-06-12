@@ -97,7 +97,7 @@ The uninstall process will:
 
 - The script uses `/Library/Scripts/Codex/load-region-spoof.sh` and `/Library/LaunchDaemons/local.codex.region-spoof-loader.plist`
 - Boot-time location spoofing uses `ipinfo.io` unless `--skip-location-spoof` is provided(use this flag when your location is not in restricted regions of Siri AI)
-- The `CodexRegionSpoof` system kext and some of this script's logic are based on work from https://github.com/WhiteSoulss/enableAppleIntelligence
+- The `CodexRegionSpoof` system kext and this script's logic are based on work from https://github.com/WhiteSoulss/enableAppleIntelligence
 - A reboot is strongly recommended after installation or uninstall
 
 ## Disclaimer
