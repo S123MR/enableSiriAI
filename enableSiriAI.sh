@@ -35,9 +35,9 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       echo "Usage: ./enable_apple_intelligence_oneclick.sh [options]"
       echo "Options:"
-      echo "  --skip-location-spoof  Skip software IP/Location spoofing (keeps Hardware model spoofing)."
-      echo "  --verify-only          Check current system state and configurations."
-      echo "  --uninstall            Remove all spoofing and revert System volume snapshot."
+      echo "  --skip-location-spoof  Skip boot-time Location spoofing."
+      echo "  --verify-only          Check current system state."
+      echo "  --uninstall            Remove all spoofing and revert System volume."
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -45,19 +45,46 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# Output formatter
 section() {
   echo
   echo "== $1 =="
 }
 
-# Auto-escalate to sudo if not root
+# --- 1. Sudo Escalation (Must be first) ---
 if [[ $EUID -ne 0 && "$DO_VERIFY_ONLY" -eq 0 ]]; then
   echo "Administrative privileges required. Prompting for sudo..."
   exec sudo "$0" "${ORIG_ARGS[@]}"
 fi
 
-# Preflight: Check SIP and Authenticated Root
+# --- 2. Safe User Home Assignment ---
+if [[ -n "${SUDO_USER:-}" ]]; then
+  REAL_HOME=$(dscl . -read /Users/"$SUDO_USER" NFSHomeDirectory | awk '{print $2}')
+else
+  REAL_HOME="$HOME"
+fi
+
+# --- 3. macOS Version Check ---
+macos_major_version() {
+  local version
+  version="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+  echo "${version%%.*}"
+}
+
+if [[ "$DO_VERIFY_ONLY" -eq 0 && "$DO_UNINSTALL" -eq 0 ]]; then
+  if [[ "$(macos_major_version)" -lt 27 ]]; then
+    section "macOS Version Alert"
+    echo "WARNING: This script is explicitly designed for macOS 27 and newer."
+    echo "Running this on an older macOS version might cause unexpected behavior."
+    if read -q "REPLY?Do you want to proceed anyway? (y/n) "; then
+      echo ""
+    else
+      echo -e "\nAborting."
+      exit 1
+    fi
+  fi
+fi
+
+# --- 4. Security Protections Check ---
 check_security_status() {
   local warn=0
   if csrutil status | grep -qi 'enabled'; then warn=1; fi
@@ -66,8 +93,7 @@ check_security_status() {
   if [[ $warn -eq 1 ]]; then
     section "Security Protections Alert"
     echo "WARNING: System Integrity Protection (SIP) or Authenticated Root appears to be enabled."
-    echo "Modifying the sealed System volume and loading custom kexts requires these to be disabled."
-    echo "If you proceed, the snapshot creation or kext loading may fail."
+    echo "Modifying the sealed System volume requires these to be disabled."
     if read -q "REPLY?Do you want to proceed anyway? (y/n) "; then
       echo ""
     else
@@ -79,23 +105,21 @@ check_security_status() {
 
 verify_only() {
   section "Preflight"
-  echo "macOS: $(sw_vers -productVersion 2>/dev/null || true)"
-  
-  section "SIP / SSV"
-  csrutil status 2>&1 || true
-  csrutil authenticated-root status 2>&1 || true
+  echo "macOS: $(sw_vers -productVersion)"
+  csrutil status
+  csrutil authenticated-root status
 
   section "Hardware Region State"
   ioreg -rd1 -c IOPlatformExpertDevice | grep -Ei '"region-info"|"country-of-origin"|"model"|"model-number"' || true
 
   section "CodexRegionSpoof Kext"
-  kmutil showloaded 2>/dev/null | grep -Ei 'Codex|RegionSpoof' || echo "CodexRegionSpoof is not currently loaded."
+  kmutil showloaded 2>/dev/null | grep -Ei 'Codex|RegionSpoof' || echo "Not loaded."
 
   section "GenerativeModels FeatureFlags (Live System)"
   if [[ -f "/System/Library/FeatureFlags/Domain/GenerativeModels.plist" ]]; then
     plutil -p "/System/Library/FeatureFlags/Domain/GenerativeModels.plist" | grep -A 2 "EnhancedSiriWaitlist" || echo "EnhancedSiriWaitlist key not found in live system."
   else
-    echo "GenerativeModels.plist not found in /System/Library/FeatureFlags/Domain/"
+    echo "GenerativeModels.plist not found in live system."
   fi
   
   exit 0
@@ -104,28 +128,27 @@ verify_only() {
 clean_previous_configurations() {
   section "Cleaning previous configurations & caches"
   mkdir -p "$CURRENT_BACKUP_DIR"
-  echo "Creating backup for this run at: $CURRENT_BACKUP_DIR"
 
-  # Unload daemons
+  # Unload daemons safely
   launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
-  rm -f "$LOADER_PLIST" "$LOADER_SCRIPT" 2>/dev/null || true
+  rm -f "$LOADER_PLIST" "$LOADER_SCRIPT"
   
-  # Non-destructive backups of original state
-  local siri_pref="$HOME/Library/Preferences/com.apple.assistant.backedup.plist"
-  [[ -f "$siri_pref" ]] && cp -n "$siri_pref" "$CURRENT_BACKUP_DIR/siri_pref.backup" 2>/dev/null || true
-  [[ -f "/private/var/db/eligibilityd/eligibility.plist" ]] && cp -n "/private/var/db/eligibilityd/eligibility.plist" "$CURRENT_BACKUP_DIR/eligibility.backup" 2>/dev/null || true
-  [[ -f "/private/var/db/os_eligibility/eligibility.plist" ]] && cp -n "/private/var/db/os_eligibility/eligibility.plist" "$CURRENT_BACKUP_DIR/os_eligibility.backup" 2>/dev/null || true
-  [[ -f "/private/var/db/com.apple.countryd/countryCodeCache.plist" ]] && cp -n "/private/var/db/com.apple.countryd/countryCodeCache.plist" "$CURRENT_BACKUP_DIR/countryCodeCache.backup" 2>/dev/null || true
+  # Strict backups (No || true suppression)
+  local siri_pref="$REAL_HOME/Library/Preferences/com.apple.assistant.backedup.plist"
+  if [[ -f "$siri_pref" ]]; then cp "$siri_pref" "$CURRENT_BACKUP_DIR/siri_pref.backup"; fi
+  if [[ -f "/private/var/db/eligibilityd/eligibility.plist" ]]; then cp "/private/var/db/eligibilityd/eligibility.plist" "$CURRENT_BACKUP_DIR/eligibility.backup"; fi
+  if [[ -f "/private/var/db/os_eligibility/eligibility.plist" ]]; then cp "/private/var/db/os_eligibility/eligibility.plist" "$CURRENT_BACKUP_DIR/os_eligibility.backup"; fi
+  if [[ -f "/private/var/db/com.apple.countryd/countryCodeCache.plist" ]]; then cp "/private/var/db/com.apple.countryd/countryCodeCache.plist" "$CURRENT_BACKUP_DIR/countryCodeCache.backup"; fi
 
-  # Remove UI locks
-  defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
-  rm -f "$HOME/Library/Containers/com.apple.systempreferences.AppleIDSettings/Data/Library/Preferences/com.apple.assistant.backedup.plist" 2>/dev/null || true
+  # Remove UI locks (Run as user to prevent root permission locks)
+  sudo -u "${SUDO_USER:-$USER}" defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
+  rm -f "$REAL_HOME/Library/Containers/com.apple.systempreferences.AppleIDSettings/Data/Library/Preferences/com.apple.assistant.backedup.plist"
   
-  # Clear eligibility cache so macOS rebuilds it natively
+  # Clear cache files
   chflags nouchg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
+  rm -f /private/var/db/eligibilityd/eligibility.plist
   chflags nouchg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
+  rm -f /private/var/db/os_eligibility/eligibility.plist
 
   # Unlock countryd cache
   chflags nouchg /private/var/db/com.apple.countryd/countryCodeCache.plist 2>/dev/null || true
@@ -135,7 +158,9 @@ clean_previous_configurations() {
 ensure_region_spoof_kext_installed() {
   section "Installing Hardware Region Spoofer"
   if [[ -d "$KEXT" ]]; then
-    echo "Kext already installed at $KEXT, replacing..."
+    echo "Unloading existing kext before replacement..."
+    kmutil unload -p "$KEXT" 2>/dev/null || true
+    rm -rf "$KEXT"
   fi
 
   if [[ ! -d "$LOCAL_KEXT" ]]; then
@@ -148,7 +173,6 @@ ensure_region_spoof_kext_installed() {
     chmod 755 "$LOCAL_KEXT_BIN"
   fi
 
-  rm -rf "$KEXT"
   cp -R "$LOCAL_KEXT" "$KEXT"
   chown -R root:wheel "$KEXT"
   chmod -R go-w "$KEXT"
@@ -157,52 +181,50 @@ ensure_region_spoof_kext_installed() {
 install_boot_loader() {
   mkdir -p /Library/Scripts/Codex
 
-  local tmp_script="$(mktemp)"
+  local tmp_script
+  tmp_script="$(mktemp)"
   cat > "$tmp_script" <<EOF
 #!/bin/zsh
-set -u
+set -e
 
 LOG="/var/log/codex-region-spoof-loader.log"
 KEXT="/Library/Extensions/CodexRegionSpoof.kext"
 
 {
   echo "==== \$(date) ===="
-  if /usr/bin/kmutil showloaded 2>/dev/null | /usr/bin/grep -qi 'local.codex.RegionSpoof'; then
-    echo "CodexRegionSpoof already loaded"
-  else
-    echo "loading \$KEXT"
-    /usr/bin/kmutil load -p "\$KEXT" || true
-  fi
-
+  /usr/bin/kmutil load -p "\$KEXT" || echo "Kext load failed, may already be loaded."
   /bin/sleep 1
   /usr/bin/killall eligibilityd generativeexperiencesd modelcatalogd 2>/dev/null || true
-
 EOF
 
-  # If not skipped, inject mainland China location override logic into loader
   if [[ "$SKIP_LOCATION_SPOOF" -eq 0 ]]; then
     cat >> "$tmp_script" <<'EOF'
-  GEO_CC="US"
-  GEO_IP="unknown"
-  GEO_CITY="unknown"
-  
-  if /usr/bin/curl -s --max-time 8 https://ipinfo.io/json >/tmp/codex_geo_ip.json 2>/dev/null; then
-    GEO_CC="$(/usr/bin/python3 -c 'import json; print((json.load(open("/tmp/codex_geo_ip.json")).get("country") or "").upper())' 2>/dev/null || true)"
-    GEO_IP="$(/usr/bin/python3 -c 'import json; print(json.load(open("/tmp/codex_geo_ip.json")).get("ip",""))' 2>/dev/null || true)"
-    GEO_CITY="$(/usr/bin/python3 -c 'import json; print(json.load(open("/tmp/codex_geo_ip.json")).get("city",""))' 2>/dev/null || true)"
-  fi
-  if [ -z "$GEO_CC" ]; then GEO_CC="US"; fi
-  
+  GEO_PLIST="/var/db/locationd/Library/Caches/GeoServices/DirectReadConfigStore.plist"
   /bin/mkdir -p /var/db/locationd/Library/Caches/GeoServices
-  /usr/bin/python3 - "$GEO_CC" "$GEO_IP" "$GEO_CITY" <<'PY'
-import plistlib, sys
-cc, ip, city = sys.argv[1:4]
-payload = {"DeviceCountryCodeSourced": {"cc": cc, "metadata": {"sourceNote": "boot-time spoof", "ip": ip, "city": city}, "source": 262}}
-with open("/var/db/locationd/Library/Caches/GeoServices/DirectReadConfigStore.plist", "wb") as f:
-    plistlib.dump(payload, f)
-PY
-  /usr/sbin/chown _locationd:_locationd /var/db/locationd/Library/Caches/GeoServices/DirectReadConfigStore.plist 2>/dev/null || true
-  /bin/chmod 0644 /var/db/locationd/Library/Caches/GeoServices/DirectReadConfigStore.plist 2>/dev/null || true
+  
+  cat > "$GEO_PLIST" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>DeviceCountryCodeSourced</key>
+    <dict>
+        <key>cc</key>
+        <string>US</string>
+        <key>source</key>
+        <integer>262</integer>
+        <key>metadata</key>
+        <dict>
+            <key>sourceNote</key>
+            <string>boot-time-spoof</string>
+        </dict>
+    </dict>
+</dict>
+</plist>
+XML
+  
+  /usr/sbin/chown _locationd:_locationd "$GEO_PLIST"
+  /bin/chmod 0644 "$GEO_PLIST"
   /usr/bin/killall locationd geod routined 2>/dev/null || true
 EOF
   fi
@@ -215,7 +237,8 @@ EOF
   install -o root -g wheel -m 755 "$tmp_script" "$LOADER_SCRIPT"
   rm -f "$tmp_script"
 
-  local tmp_plist="$(mktemp)"
+  local tmp_plist
+  tmp_plist="$(mktemp)"
   cat > "$tmp_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -236,69 +259,50 @@ EOF
   rm -f "$tmp_plist"
 
   echo "Bootstrapping LaunchDaemon..."
-  launchctl bootstrap system "$LOADER_PLIST" || { echo "Error: Failed to bootstrap LaunchDaemon"; exit 1; }
-  launchctl kickstart -k system/local.codex.region-spoof-loader || { echo "Error: Failed to kickstart LaunchDaemon"; exit 1; }
+  launchctl bootstrap system "$LOADER_PLIST" || { echo "Fatal Error: Failed to bootstrap LaunchDaemon"; exit 1; }
+  launchctl kickstart -k system/local.codex.region-spoof-loader || { echo "Fatal Error: Failed to kickstart LaunchDaemon"; exit 1; }
 }
 
 modify_system_volume() {
   section "Mounting & Editing Sealed System Volume"
   
-  # Step 6: Find root device (matches diskutil apfs list Role: System)
-  local root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
+  local root_dev
+  root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
   if [[ -z "$root_dev" ]]; then
-    echo "Error: Could not determine root device." >&2
+    echo "Fatal Error: Could not determine root device." >&2
     exit 1
   fi
-  # Convert snapshot identifier (e.g. disk3s5s1) to volume identifier (e.g. disk3s5)
-  local sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+  
+  local sys_dev
+  sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
   echo "Identified System Volume: $sys_dev"
 
-  # Step 7: Mount
   mkdir -p "$MOUNT_POINT"
   echo "Mounting $sys_dev to $MOUNT_POINT (Read/Write)..."
   mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT"
 
-  # Step 8: Edit the plist using Python
   if [[ -f "$PLIST_PATH" ]]; then
     echo "Found GenerativeModels.plist. Backing up and editing..."
-    cp -n "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup" 2>/dev/null || true
+    cp "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup"
     
-    local patcher="$(mktemp)"
-    cat > "$patcher" <<'PY'
-import os, plistlib, sys
-path = sys.argv[1]
-try:
-    with open(path, "rb") as f:
-        data = plistlib.load(f)
-except FileNotFoundError:
-    data = {}
-
-if "EnhancedSiriWaitlist" not in data or not isinstance(data["EnhancedSiriWaitlist"], dict):
-    data["EnhancedSiriWaitlist"] = {}
-
-data["EnhancedSiriWaitlist"]["Enabled"] = False
-
-tmp = f"{path}.tmp"
-with open(tmp, "wb") as f:
-    plistlib.dump(data, f, fmt=plistlib.FMT_BINARY)
-
-os.replace(tmp, path)
-print("Successfully modified EnhancedSiriWaitlist:Enabled to <false/>")
-PY
-    /usr/bin/python3 "$patcher" "$PLIST_PATH"
-    rm -f "$patcher"
+    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$PLIST_PATH" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH"
     
-    # Ensure proper permissions
     chown root:wheel "$PLIST_PATH"
     chmod 0644 "$PLIST_PATH"
   else
-    echo "Error: $PLIST_PATH not found on the system volume!"
+    echo "Fatal Error: $PLIST_PATH not found on the system volume!"
+    umount "$MOUNT_POINT"
     exit 1
   fi
 
-  # Step 9: Bless the snapshot
   echo "Creating new EFI boot snapshot..."
   bless --mount "$MOUNT_POINT" --bootefi --create-snapshot
+  
+  echo "Unmounting System Volume..."
+  umount "$MOUNT_POINT"
+  
   echo "Snapshot created successfully!"
 }
 
@@ -306,41 +310,43 @@ uninstall() {
   section "Apple Intelligence Uninstall / Restore"
   check_security_status
   
-  # Find the absolute latest backup directory
-  LATEST_BACKUP=""
+  local LATEST_BACKUP=""
   if [[ -d "$BACKUP_BASE" ]]; then
     LATEST_BACKUP=$(ls -td "$BACKUP_BASE"/*/ 2>/dev/null | head -1 || true)
   fi
 
-  # Unload and remove Kext and Daemons first
   echo "Unloading and removing CodexRegionSpoof.kext and Daemons..."
   if [[ -d "$KEXT" ]]; then
     kmutil unload -p "$KEXT" 2>/dev/null || true
     rm -rf "$KEXT"
   fi
   launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
-  rm -f "$LOADER_PLIST" "$LOADER_SCRIPT" 2>/dev/null || true
+  rm -f "$LOADER_PLIST" "$LOADER_SCRIPT"
   
-  # Clear existing forced files so we don't leave corrupt data behind if no backup exists
-  defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
+  sudo -u "${SUDO_USER:-$USER}" defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
   chflags nouchg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
+  rm -f /private/var/db/eligibilityd/eligibility.plist
   chflags nouchg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
+  rm -f /private/var/db/os_eligibility/eligibility.plist
 
   if [[ -n "$LATEST_BACKUP" ]]; then
     echo "Restoring previous preferences and caches from: $LATEST_BACKUP"
-    local siri_pref="$HOME/Library/Preferences/com.apple.assistant.backedup.plist"
-    [[ -f "$LATEST_BACKUP/siri_pref.backup" ]] && cp "$LATEST_BACKUP/siri_pref.backup" "$siri_pref" && chown $(stat -f "%Su" "$HOME") "$siri_pref" 2>/dev/null || true
-    [[ -f "$LATEST_BACKUP/eligibility.backup" ]] && cp "$LATEST_BACKUP/eligibility.backup" "/private/var/db/eligibilityd/eligibility.plist" 2>/dev/null || true
-    [[ -f "$LATEST_BACKUP/os_eligibility.backup" ]] && cp "$LATEST_BACKUP/os_eligibility.backup" "/private/var/db/os_eligibility/eligibility.plist" 2>/dev/null || true
-    [[ -f "$LATEST_BACKUP/countryCodeCache.backup" ]] && cp "$LATEST_BACKUP/countryCodeCache.backup" "/private/var/db/com.apple.countryd/countryCodeCache.plist" 2>/dev/null || true
+    local siri_pref="$REAL_HOME/Library/Preferences/com.apple.assistant.backedup.plist"
+    
+    if [[ -f "$LATEST_BACKUP/siri_pref.backup" ]]; then
+      cp "$LATEST_BACKUP/siri_pref.backup" "$siri_pref"
+      chown $(stat -f "%Su" "$REAL_HOME") "$siri_pref"
+    fi
+    if [[ -f "$LATEST_BACKUP/eligibility.backup" ]]; then cp "$LATEST_BACKUP/eligibility.backup" "/private/var/db/eligibilityd/eligibility.plist"; fi
+    if [[ -f "$LATEST_BACKUP/os_eligibility.backup" ]]; then cp "$LATEST_BACKUP/os_eligibility.backup" "/private/var/db/os_eligibility/eligibility.plist"; fi
+    if [[ -f "$LATEST_BACKUP/countryCodeCache.backup" ]]; then cp "$LATEST_BACKUP/countryCodeCache.backup" "/private/var/db/com.apple.countryd/countryCodeCache.plist"; fi
 
-    # Restore System Volume modification if backup exists
     if [[ -f "$LATEST_BACKUP/GenerativeModels.plist.backup" ]]; then
       section "Restoring System Volume..."
-      local root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
-      local sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+      local root_dev
+      root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
+      local sys_dev
+      sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
       
       mkdir -p "$MOUNT_POINT"
       mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT"
@@ -352,6 +358,8 @@ uninstall() {
       
       echo "Creating new restored boot snapshot..."
       bless --mount "$MOUNT_POINT" --bootefi --create-snapshot
+      
+      umount "$MOUNT_POINT"
       echo "System volume restored."
     else
       echo "No GenerativeModels.plist backup found. Skipping System volume restore."
@@ -362,12 +370,11 @@ uninstall() {
 
   section "Uninstall Complete"
   echo "Note: The backup folder ($BACKUP_BASE) was intentionally kept."
-  echo "Reboot your Mac for all changes to take effect and to boot into the restored snapshot."
+  echo "Reboot your Mac to boot into the restored snapshot."
   exit 0
 }
 
 # --- Execution Flow ---
-
 if [[ "$DO_VERIFY_ONLY" -eq 1 ]]; then
   verify_only
 fi
@@ -383,14 +390,13 @@ install_boot_loader
 modify_system_volume
 
 section "Installation Complete!"
-echo "The script has successfully:"
 echo "1. Backed up and cleared old configuration caches."
 echo "2. Installed the secure hardware spoofer."
 if [[ "$SKIP_LOCATION_SPOOF" -eq 1 ]]; then
-  echo "3. Skipped Location/Geo spoofing (as requested by flag)."
+  echo "3. Skipped Location/Geo spoofing."
 else
-  echo "3. Configured boot-time US Location/Geo spoofing."
+  echo "3. Configured secure boot-time US Location/Geo spoofing."
 fi
-echo "4. Edited the sealed system volume (GenerativeModels.plist) and created a new snapshot."
+echo "4. Edited the sealed system volume and created a new snapshot."
 echo ""
-echo "Next Step: Reboot your Mac. You should now be greeted with the new Siri AI!"
+echo "Next Step: Reboot your Mac to activate Siri AI!"
