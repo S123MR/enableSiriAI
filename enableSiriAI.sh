@@ -26,6 +26,15 @@ CURRENT_BACKUP_DIR="$BACKUP_BASE/run-$TIMESTAMP"
 
 ORIG_ARGS=("$@")
 
+# --- Global Cleanup Trap ---
+cleanup() {
+  if mount | grep -q "$MOUNT_POINT"; then
+    echo "Cleaning up: Unmounting $MOUNT_POINT..."
+    umount "$MOUNT_POINT" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,7 +42,7 @@ while [[ $# -gt 0 ]]; do
     --verify-only) DO_VERIFY_ONLY=1 ;;
     --skip-location-spoof) SKIP_LOCATION_SPOOF=1 ;;
     -h|--help)
-      echo "Usage: ./enable_apple_intelligence_oneclick.sh [options]"
+      echo "Usage: ./$(basename "$0") [options]"
       echo "Options:"
       echo "  --skip-location-spoof  Skip boot-time Location spoofing."
       echo "  --verify-only          Check current system state."
@@ -58,7 +67,8 @@ fi
 
 # --- 2. Safe User Home Assignment ---
 if [[ -n "${SUDO_USER:-}" ]]; then
-  REAL_HOME=$(dscl . -read /Users/"$SUDO_USER" NFSHomeDirectory | awk '{print $2}')
+  REAL_HOME=$(dscl . -read /Users/"$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)
+  [[ -z "$REAL_HOME" ]] && REAL_HOME="$HOME"
 else
   REAL_HOME="$HOME"
 fi
@@ -145,13 +155,13 @@ clean_previous_configurations() {
   rm -f "$REAL_HOME/Library/Containers/com.apple.systempreferences.AppleIDSettings/Data/Library/Preferences/com.apple.assistant.backedup.plist"
   
   # Clear cache files
-  chflags nouchg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
+  chflags nouchg,noschg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/eligibilityd/eligibility.plist
-  chflags nouchg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
+  chflags nouchg,noschg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/os_eligibility/eligibility.plist
 
   # Unlock countryd cache
-  chflags nouchg /private/var/db/com.apple.countryd/countryCodeCache.plist 2>/dev/null || true
+  chflags nouchg,noschg /private/var/db/com.apple.countryd/countryCodeCache.plist 2>/dev/null || true
   chmod 0644 /private/var/db/com.apple.countryd/countryCodeCache.plist 2>/dev/null || true
 }
 
@@ -169,7 +179,7 @@ ensure_region_spoof_kext_installed() {
   fi
 
   if [[ ! -x "$LOCAL_KEXT_BIN" && -f "$LOCAL_KEXT_BIN_B64" ]]; then
-    /usr/bin/base64 -D -i "$LOCAL_KEXT_BIN_B64" -o "$LOCAL_KEXT_BIN"
+    /usr/bin/base64 -D -i "$LOCAL_KEXT_BIN_B64" -o "$LOCAL_KEXT_BIN" || { echo "Fatal Error: Kext payload decoding failed."; exit 1; }
     chmod 755 "$LOCAL_KEXT_BIN"
   fi
 
@@ -259,6 +269,7 @@ EOF
   rm -f "$tmp_plist"
 
   echo "Bootstrapping LaunchDaemon..."
+  launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
   launchctl bootstrap system "$LOADER_PLIST" || { echo "Fatal Error: Failed to bootstrap LaunchDaemon"; exit 1; }
   launchctl kickstart -k system/local.codex.region-spoof-loader || { echo "Fatal Error: Failed to kickstart LaunchDaemon"; exit 1; }
 }
@@ -275,35 +286,39 @@ modify_system_volume() {
   
   local sys_dev
   sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+  if [[ ! -b "$sys_dev" ]]; then
+    echo "Fatal Error: Parsed device $sys_dev is not a valid block device." >&2
+    exit 1
+  fi
+  
   echo "Identified System Volume: $sys_dev"
 
   mkdir -p "$MOUNT_POINT"
   echo "Mounting $sys_dev to $MOUNT_POINT (Read/Write)..."
-  mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT"
+  mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT" || { echo "Fatal Error: Failed to mount System Volume."; exit 1; }
 
   if [[ -f "$PLIST_PATH" ]]; then
     echo "Found GenerativeModels.plist. Backing up and editing..."
     cp "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup"
     
+    # Use native PlistBuddy to safely edit EnhancedSiriWaitlist key
     /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" 2>/dev/null || true
     /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$PLIST_PATH" 2>/dev/null || \
-    /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH"
+    /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH" || \
+    { echo "Fatal Error: PlistBuddy failed to modify the plist."; exit 1; }
     
     chown root:wheel "$PLIST_PATH"
     chmod 0644 "$PLIST_PATH"
   else
     echo "Fatal Error: $PLIST_PATH not found on the system volume!"
-    umount "$MOUNT_POINT"
     exit 1
   fi
 
   echo "Creating new EFI boot snapshot..."
-  bless --mount "$MOUNT_POINT" --bootefi --create-snapshot
-  
-  echo "Unmounting System Volume..."
-  umount "$MOUNT_POINT"
+  bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
   
   echo "Snapshot created successfully!"
+  # Trap handles unmounting
 }
 
 uninstall() {
@@ -324,9 +339,9 @@ uninstall() {
   rm -f "$LOADER_PLIST" "$LOADER_SCRIPT"
   
   sudo -u "${SUDO_USER:-$USER}" defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
-  chflags nouchg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
+  chflags nouchg,noschg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/eligibilityd/eligibility.plist
-  chflags nouchg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
+  chflags nouchg,noschg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/os_eligibility/eligibility.plist
 
   if [[ -n "$LATEST_BACKUP" ]]; then
@@ -347,9 +362,13 @@ uninstall() {
       root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
       local sys_dev
       sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+      if [[ ! -b "$sys_dev" ]]; then
+        echo "Fatal Error: Parsed device $sys_dev is not a valid block device." >&2
+        exit 1
+      fi
       
       mkdir -p "$MOUNT_POINT"
-      mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT"
+      mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT" || { echo "Fatal Error: Failed to mount System Volume."; exit 1; }
       
       echo "Restoring original GenerativeModels.plist..."
       cp "$LATEST_BACKUP/GenerativeModels.plist.backup" "$PLIST_PATH"
@@ -357,9 +376,8 @@ uninstall() {
       chmod 0644 "$PLIST_PATH"
       
       echo "Creating new restored boot snapshot..."
-      bless --mount "$MOUNT_POINT" --bootefi --create-snapshot
+      bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
       
-      umount "$MOUNT_POINT"
       echo "System volume restored."
     else
       echo "No GenerativeModels.plist backup found. Skipping System volume restore."
