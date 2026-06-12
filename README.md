@@ -51,7 +51,10 @@ cd /path/to/enableSIriAI
   - Prints macOS version, SIP/Authenticated Root status, hardware region info, loaded kext status, and the live `GenerativeModels.plist` state
 
 - `--skip-location-spoof`
-  - Install the hardware region spoofer but skip the boot-time location/IP spoofing logic(when you are not in restrcited regions of Siri AI(including network))
+  - Install the hardware region spoofer but skip the boot-time location/IP spoofing logic (when you are not in restricted regions of Siri AI, including network)
+
+- `--safe-override`
+  - Use a local `/Library/Preferences/FeatureFlags/Domain/GenerativeModels.plist` override instead of modifying the sealed APFS system snapshot(authenticated-root is not required in this occasion)
 
 ## Recommended workflow
 
@@ -74,6 +77,12 @@ cd /Users/yourname/Downloads/enableSIriAI
 
 ```zsh
 ./enableSiriAI.sh --skip-location-spoof
+```
+
+5. To use a local feature override instead of modifying the sealed APFS snapshot, run:
+
+```zsh
+./enableSiriAI.sh --safe-override
 ```
 
 6. Reboot after the script completes.

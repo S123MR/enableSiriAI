@@ -9,6 +9,7 @@ cd "$ROOT_DIR"
 DO_UNINSTALL=0
 DO_VERIFY_ONLY=0
 SKIP_LOCATION_SPOOF=0
+USE_SAFE_OVERRIDE=0
 
 KEXT="/Library/Extensions/CodexRegionSpoof.kext"
 LOCAL_KEXT="$ROOT_DIR/tools/CodexRegionSpoof.kext"
@@ -16,8 +17,14 @@ LOCAL_KEXT_BIN="$LOCAL_KEXT/Contents/MacOS/CodexRegionSpoof"
 LOCAL_KEXT_BIN_B64="$LOCAL_KEXT/Contents/MacOS/CodexRegionSpoof.b64"
 LOADER_SCRIPT="/Library/Scripts/Codex/load-region-spoof.sh"
 LOADER_PLIST="/Library/LaunchDaemons/local.codex.region-spoof-loader.plist"
+
+# APFS Snapshot Variables
 MOUNT_POINT="/tmp/mount"
 PLIST_PATH="$MOUNT_POINT/System/Library/FeatureFlags/Domain/GenerativeModels.plist"
+
+# Safe Override Variables
+OVERRIDE_DIR="/Library/Preferences/FeatureFlags/Domain"
+OVERRIDE_PLIST="$OVERRIDE_DIR/GenerativeModels.plist"
 
 # Backup Architecture
 BACKUP_BASE="$ROOT_DIR/backup"
@@ -41,12 +48,14 @@ while [[ $# -gt 0 ]]; do
     --uninstall) DO_UNINSTALL=1 ;;
     --verify-only) DO_VERIFY_ONLY=1 ;;
     --skip-location-spoof) SKIP_LOCATION_SPOOF=1 ;;
+    --safe-override) USE_SAFE_OVERRIDE=1 ;;
     -h|--help)
       echo "Usage: ./$(basename "$0") [options]"
       echo "Options:"
       echo "  --skip-location-spoof  Skip boot-time Location spoofing."
+      echo "  --safe-override        Use local /Library override instead of APFS snapshot."
       echo "  --verify-only          Check current system state."
-      echo "  --uninstall            Remove all spoofing and revert System volume."
+      echo "  --uninstall            Remove all spoofing and revert system configurations."
       exit 0
       ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
@@ -103,7 +112,9 @@ check_security_status() {
   if [[ $warn -eq 1 ]]; then
     section "Security Protections Alert"
     echo "WARNING: System Integrity Protection (SIP) or Authenticated Root appears to be enabled."
-    echo "Modifying the sealed System volume requires these to be disabled."
+    if [[ "$USE_SAFE_OVERRIDE" -eq 0 ]]; then
+      echo "Modifying the sealed System volume requires these to be disabled."
+    fi
     if read -q "REPLY?Do you want to proceed anyway? (y/n) "; then
       echo ""
     else
@@ -127,9 +138,12 @@ verify_only() {
 
   section "GenerativeModels FeatureFlags (Live System)"
   if [[ -f "/System/Library/FeatureFlags/Domain/GenerativeModels.plist" ]]; then
-    plutil -p "/System/Library/FeatureFlags/Domain/GenerativeModels.plist" | grep -A 2 "EnhancedSiriWaitlist" || echo "EnhancedSiriWaitlist key not found in live system."
-  else
-    echo "GenerativeModels.plist not found in live system."
+    echo "--- System Volume Plist ---"
+    plutil -p "/System/Library/FeatureFlags/Domain/GenerativeModels.plist" | grep -A 2 "EnhancedSiriWaitlist" || echo "EnhancedSiriWaitlist key not found."
+  fi
+  if [[ -f "$OVERRIDE_PLIST" ]]; then
+    echo "--- Safe Override Plist ---"
+    plutil -p "$OVERRIDE_PLIST" | grep -A 2 "EnhancedSiriWaitlist" || echo "EnhancedSiriWaitlist key not found."
   fi
   
   exit 0
@@ -274,51 +288,73 @@ EOF
   launchctl kickstart -k system/local.codex.region-spoof-loader || { echo "Fatal Error: Failed to kickstart LaunchDaemon"; exit 1; }
 }
 
-modify_system_volume() {
-  section "Mounting & Editing Sealed System Volume"
-  
-  local root_dev
-  root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
-  if [[ -z "$root_dev" ]]; then
-    echo "Fatal Error: Could not determine root device." >&2
-    exit 1
-  fi
-  
-  local sys_dev
-  sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
-  if [[ ! -b "$sys_dev" ]]; then
-    echo "Fatal Error: Parsed device $sys_dev is not a valid block device." >&2
-    exit 1
-  fi
-  
-  echo "Identified System Volume: $sys_dev"
-
-  mkdir -p "$MOUNT_POINT"
-  echo "Mounting $sys_dev to $MOUNT_POINT (Read/Write)..."
-  mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT" || { echo "Fatal Error: Failed to mount System Volume."; exit 1; }
-
-  if [[ -f "$PLIST_PATH" ]]; then
-    echo "Found GenerativeModels.plist. Backing up and editing..."
-    cp "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup"
+apply_generative_models_patch() {
+  if [[ "$USE_SAFE_OVERRIDE" -eq 1 ]]; then
+    section "Applying Safe FeatureFlag Override"
     
-    # Use native PlistBuddy to safely edit EnhancedSiriWaitlist key
-    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" 2>/dev/null || true
-    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$PLIST_PATH" 2>/dev/null || \
-    /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH" || \
-    { echo "Fatal Error: PlistBuddy failed to modify the plist."; exit 1; }
+    mkdir -p "$OVERRIDE_DIR"
+    if [[ -f "$OVERRIDE_PLIST" ]]; then
+      cp "$OVERRIDE_PLIST" "$CURRENT_BACKUP_DIR/GenerativeModels_Override.plist.backup"
+    fi
     
-    chown root:wheel "$PLIST_PATH"
-    chmod 0644 "$PLIST_PATH"
+    # Clear the file if it exists, or create a new empty dict
+    /usr/libexec/PlistBuddy -c "Clear dict" "$OVERRIDE_PLIST" 2>/dev/null || true
+    
+    # Rebuild the required structure
+    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$OVERRIDE_PLIST" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$OVERRIDE_PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$OVERRIDE_PLIST" || \
+    { echo "Fatal Error: PlistBuddy failed to modify the safe override plist."; exit 1; }
+    
+    chown root:wheel "$OVERRIDE_PLIST"
+    chmod 0644 "$OVERRIDE_PLIST"
+    echo "Safe FeatureFlag Override applied successfully to $OVERRIDE_PLIST!"
+    
   else
-    echo "Fatal Error: $PLIST_PATH not found on the system volume!"
-    exit 1
-  fi
+    section "Mounting & Editing Sealed System Volume"
+    
+    local root_dev
+    root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
+    if [[ -z "$root_dev" ]]; then
+      echo "Fatal Error: Could not determine root device." >&2
+      exit 1
+    fi
+    
+    local sys_dev
+    sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+    if [[ ! -b "$sys_dev" ]]; then
+      echo "Fatal Error: Parsed device $sys_dev is not a valid block device." >&2
+      exit 1
+    fi
+    
+    echo "Identified System Volume: $sys_dev"
 
-  echo "Creating new EFI boot snapshot..."
-  bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
-  
-  echo "Snapshot created successfully!"
-  # Trap handles unmounting
+    mkdir -p "$MOUNT_POINT"
+    echo "Mounting $sys_dev to $MOUNT_POINT (Read/Write)..."
+    mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT" || { echo "Fatal Error: Failed to mount System Volume."; exit 1; }
+
+    if [[ -f "$PLIST_PATH" ]]; then
+      echo "Found GenerativeModels.plist. Backing up and editing..."
+      cp "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup"
+      
+      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" 2>/dev/null || true
+      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$PLIST_PATH" 2>/dev/null || \
+      /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH" || \
+      { echo "Fatal Error: PlistBuddy failed to modify the plist."; exit 1; }
+      
+      chown root:wheel "$PLIST_PATH"
+      chmod 0644 "$PLIST_PATH"
+    else
+      echo "Fatal Error: $PLIST_PATH not found on the system volume!"
+      exit 1
+    fi
+
+    echo "Creating new EFI boot snapshot..."
+    bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
+    
+    echo "Snapshot created successfully!"
+    # The global trap handles unmounting
+  fi
 }
 
 uninstall() {
@@ -344,6 +380,12 @@ uninstall() {
   chflags nouchg,noschg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/os_eligibility/eligibility.plist
 
+  # Clean up the safe override file if it exists
+  if [[ -f "$OVERRIDE_PLIST" ]]; then
+    echo "Removing Safe FeatureFlag Override..."
+    rm -f "$OVERRIDE_PLIST"
+  fi
+
   if [[ -n "$LATEST_BACKUP" ]]; then
     echo "Restoring previous preferences and caches from: $LATEST_BACKUP"
     local siri_pref="$REAL_HOME/Library/Preferences/com.apple.assistant.backedup.plist"
@@ -356,6 +398,15 @@ uninstall() {
     if [[ -f "$LATEST_BACKUP/os_eligibility.backup" ]]; then cp "$LATEST_BACKUP/os_eligibility.backup" "/private/var/db/os_eligibility/eligibility.plist"; fi
     if [[ -f "$LATEST_BACKUP/countryCodeCache.backup" ]]; then cp "$LATEST_BACKUP/countryCodeCache.backup" "/private/var/db/com.apple.countryd/countryCodeCache.plist"; fi
 
+    # Restore safe override if backed up
+    if [[ -f "$LATEST_BACKUP/GenerativeModels_Override.plist.backup" ]]; then
+       mkdir -p "$OVERRIDE_DIR"
+       cp "$LATEST_BACKUP/GenerativeModels_Override.plist.backup" "$OVERRIDE_PLIST"
+       chown root:wheel "$OVERRIDE_PLIST"
+       chmod 0644 "$OVERRIDE_PLIST"
+    fi
+
+    # Restore snapshot if backed up
     if [[ -f "$LATEST_BACKUP/GenerativeModels.plist.backup" ]]; then
       section "Restoring System Volume..."
       local root_dev
@@ -380,7 +431,7 @@ uninstall() {
       
       echo "System volume restored."
     else
-      echo "No GenerativeModels.plist backup found. Skipping System volume restore."
+      echo "No GenerativeModels.plist (Snapshot) backup found. Skipping System volume restore."
     fi
   else
     echo "No backup directory found! Skipping file restoration."
@@ -388,7 +439,7 @@ uninstall() {
 
   section "Uninstall Complete"
   echo "Note: The backup folder ($BACKUP_BASE) was intentionally kept."
-  echo "Reboot your Mac to boot into the restored snapshot."
+  echo "Reboot your Mac to boot into the restored configuration."
   exit 0
 }
 
@@ -405,7 +456,7 @@ check_security_status
 clean_previous_configurations
 ensure_region_spoof_kext_installed
 install_boot_loader
-modify_system_volume
+apply_generative_models_patch
 
 section "Installation Complete!"
 echo "1. Backed up and cleared old configuration caches."
@@ -415,6 +466,10 @@ if [[ "$SKIP_LOCATION_SPOOF" -eq 1 ]]; then
 else
   echo "3. Configured secure boot-time US Location/Geo spoofing."
 fi
-echo "4. Edited the sealed system volume and created a new snapshot."
+if [[ "$USE_SAFE_OVERRIDE" -eq 1 ]]; then
+  echo "4. Applied Safe FeatureFlag Override (System Volume untouched)."
+else
+  echo "4. Edited the sealed system volume and created a new snapshot."
+fi
 echo ""
 echo "Next Step: Reboot your Mac to activate Siri AI!"
