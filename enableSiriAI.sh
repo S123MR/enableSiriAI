@@ -35,9 +35,9 @@ ORIG_ARGS=("$@")
 
 # --- Global Cleanup Trap ---
 cleanup() {
-  if mount | grep -q "$MOUNT_POINT"; then
+  if mount | grep -q " on $MOUNT_POINT "; then
     echo "Cleaning up: Unmounting $MOUNT_POINT..."
-    umount "$MOUNT_POINT" 2>/dev/null || true
+    diskutil unmount force "$MOUNT_POINT" 2>/dev/null || umount "$MOUNT_POINT" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -68,15 +68,19 @@ section() {
   echo "== $1 =="
 }
 
-# --- 1. Sudo Escalation (Must be first) ---
+# --- 1. Sudo Escalation (Must be first, array expansion safely handled) ---
 if [[ $EUID -ne 0 && "$DO_VERIFY_ONLY" -eq 0 ]]; then
   echo "Administrative privileges required. Prompting for sudo..."
-  exec sudo "$0" "${ORIG_ARGS[@]}"
+  if [[ ${#ORIG_ARGS[@]} -gt 0 ]]; then
+    exec sudo "$0" "${ORIG_ARGS[@]}"
+  else
+    exec sudo "$0"
+  fi
 fi
 
-# --- 2. Safe User Home Assignment ---
+# --- 2. Safe User Home Assignment (handles spaces) ---
 if [[ -n "${SUDO_USER:-}" ]]; then
-  REAL_HOME=$(dscl . -read /Users/"$SUDO_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)
+  REAL_HOME=$(dscl . -read /Users/"$SUDO_USER" NFSHomeDirectory 2>/dev/null | sed 's/^[[:space:]]*NFSHomeDirectory:[[:space:]]*//' || true)
   [[ -z "$REAL_HOME" ]] && REAL_HOME="$HOME"
 else
   REAL_HOME="$HOME"
@@ -157,16 +161,17 @@ clean_previous_configurations() {
   launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
   rm -f "$LOADER_PLIST" "$LOADER_SCRIPT"
   
-  # Strict backups (No || true suppression)
+  # Strict backups
   local siri_pref="$REAL_HOME/Library/Preferences/com.apple.assistant.backedup.plist"
   if [[ -f "$siri_pref" ]]; then cp "$siri_pref" "$CURRENT_BACKUP_DIR/siri_pref.backup"; fi
   if [[ -f "/private/var/db/eligibilityd/eligibility.plist" ]]; then cp "/private/var/db/eligibilityd/eligibility.plist" "$CURRENT_BACKUP_DIR/eligibility.backup"; fi
   if [[ -f "/private/var/db/os_eligibility/eligibility.plist" ]]; then cp "/private/var/db/os_eligibility/eligibility.plist" "$CURRENT_BACKUP_DIR/os_eligibility.backup"; fi
   if [[ -f "/private/var/db/com.apple.countryd/countryCodeCache.plist" ]]; then cp "/private/var/db/com.apple.countryd/countryCodeCache.plist" "$CURRENT_BACKUP_DIR/countryCodeCache.backup"; fi
 
-  # Remove UI locks (Run as user to prevent root permission locks)
+  # Remove UI locks & Flush Preference Caches
   sudo -u "${SUDO_USER:-$USER}" defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
   rm -f "$REAL_HOME/Library/Containers/com.apple.systempreferences.AppleIDSettings/Data/Library/Preferences/com.apple.assistant.backedup.plist"
+  killall cfprefsd 2>/dev/null || true
   
   # Clear cache files
   chflags nouchg,noschg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
@@ -297,10 +302,7 @@ apply_generative_models_patch() {
       cp "$OVERRIDE_PLIST" "$CURRENT_BACKUP_DIR/GenerativeModels_Override.plist.backup"
     fi
     
-    # Clear the file if it exists, or create a new empty dict
     /usr/libexec/PlistBuddy -c "Clear dict" "$OVERRIDE_PLIST" 2>/dev/null || true
-    
-    # Rebuild the required structure
     /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$OVERRIDE_PLIST" 2>/dev/null || true
     /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$OVERRIDE_PLIST" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$OVERRIDE_PLIST" || \
@@ -353,7 +355,7 @@ apply_generative_models_patch() {
     bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
     
     echo "Snapshot created successfully!"
-    # The global trap handles unmounting
+    diskutil unmount force "$MOUNT_POINT" 2>/dev/null || umount "$MOUNT_POINT" 2>/dev/null || true
   fi
 }
 
@@ -362,8 +364,12 @@ uninstall() {
   check_security_status
   
   local LATEST_BACKUP=""
+  local OLDEST_BACKUP=""
+  
   if [[ -d "$BACKUP_BASE" ]]; then
+    # Use latest backup for caching/preferences, but oldest backup for pristine system files
     LATEST_BACKUP=$(ls -td "$BACKUP_BASE"/*/ 2>/dev/null | head -1 || true)
+    OLDEST_BACKUP=$(ls -td "$BACKUP_BASE"/*/ 2>/dev/null | tail -1 || true)
   fi
 
   echo "Unloading and removing CodexRegionSpoof.kext and Daemons..."
@@ -375,12 +381,13 @@ uninstall() {
   rm -f "$LOADER_PLIST" "$LOADER_SCRIPT"
   
   sudo -u "${SUDO_USER:-$USER}" defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
+  killall cfprefsd 2>/dev/null || true
+  
   chflags nouchg,noschg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/eligibilityd/eligibility.plist
   chflags nouchg,noschg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/os_eligibility/eligibility.plist
 
-  # Clean up the safe override file if it exists
   if [[ -f "$OVERRIDE_PLIST" ]]; then
     echo "Removing Safe FeatureFlag Override..."
     rm -f "$OVERRIDE_PLIST"
@@ -398,7 +405,6 @@ uninstall() {
     if [[ -f "$LATEST_BACKUP/os_eligibility.backup" ]]; then cp "$LATEST_BACKUP/os_eligibility.backup" "/private/var/db/os_eligibility/eligibility.plist"; fi
     if [[ -f "$LATEST_BACKUP/countryCodeCache.backup" ]]; then cp "$LATEST_BACKUP/countryCodeCache.backup" "/private/var/db/com.apple.countryd/countryCodeCache.plist"; fi
 
-    # Restore safe override if backed up
     if [[ -f "$LATEST_BACKUP/GenerativeModels_Override.plist.backup" ]]; then
        mkdir -p "$OVERRIDE_DIR"
        cp "$LATEST_BACKUP/GenerativeModels_Override.plist.backup" "$OVERRIDE_PLIST"
@@ -406,9 +412,9 @@ uninstall() {
        chmod 0644 "$OVERRIDE_PLIST"
     fi
 
-    # Restore snapshot if backed up
-    if [[ -f "$LATEST_BACKUP/GenerativeModels.plist.backup" ]]; then
-      section "Restoring System Volume..."
+    # System file restoration (Uses OLDEST_BACKUP to prevent double-run tamper restores)
+    if [[ -n "$OLDEST_BACKUP" && -f "$OLDEST_BACKUP/GenerativeModels.plist.backup" ]]; then
+      section "Restoring System Volume (From pristine backup: $OLDEST_BACKUP)..."
       local root_dev
       root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
       local sys_dev
@@ -422,16 +428,17 @@ uninstall() {
       mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT" || { echo "Fatal Error: Failed to mount System Volume."; exit 1; }
       
       echo "Restoring original GenerativeModels.plist..."
-      cp "$LATEST_BACKUP/GenerativeModels.plist.backup" "$PLIST_PATH"
+      cp "$OLDEST_BACKUP/GenerativeModels.plist.backup" "$PLIST_PATH"
       chown root:wheel "$PLIST_PATH"
       chmod 0644 "$PLIST_PATH"
       
       echo "Creating new restored boot snapshot..."
       bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
       
+      diskutil unmount force "$MOUNT_POINT" 2>/dev/null || umount "$MOUNT_POINT" 2>/dev/null || true
       echo "System volume restored."
     else
-      echo "No GenerativeModels.plist (Snapshot) backup found. Skipping System volume restore."
+      echo "No GenerativeModels.plist pristine backup found. Skipping System volume restore."
     fi
   else
     echo "No backup directory found! Skipping file restoration."
