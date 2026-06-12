@@ -18,7 +18,11 @@ LOADER_SCRIPT="/Library/Scripts/Codex/load-region-spoof.sh"
 LOADER_PLIST="/Library/LaunchDaemons/local.codex.region-spoof-loader.plist"
 MOUNT_POINT="/tmp/mount"
 PLIST_PATH="$MOUNT_POINT/System/Library/FeatureFlags/Domain/GenerativeModels.plist"
-BACKUP_DIR="/private/var/db/codex_featureflags_backup"
+
+# Backup Architecture
+BACKUP_BASE="$ROOT_DIR/backup"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+CURRENT_BACKUP_DIR="$BACKUP_BASE/run-$TIMESTAMP"
 
 ORIG_ARGS=("$@")
 
@@ -99,24 +103,25 @@ verify_only() {
 
 clean_previous_configurations() {
   section "Cleaning previous configurations & caches"
-  mkdir -p "$BACKUP_DIR"
+  mkdir -p "$CURRENT_BACKUP_DIR"
+  echo "Creating backup for this run at: $CURRENT_BACKUP_DIR"
 
   # Unload daemons
   launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
   rm -f "$LOADER_PLIST" "$LOADER_SCRIPT" 2>/dev/null || true
   
-  # Non-destructive backups of original state (cp -n prevents overwriting the very first backup)
+  # Non-destructive backups of original state
   local siri_pref="$HOME/Library/Preferences/com.apple.assistant.backedup.plist"
-  [[ -f "$siri_pref" ]] && cp -n "$siri_pref" "$BACKUP_DIR/siri_pref.backup" 2>/dev/null || true
-  [[ -f "/private/var/db/eligibilityd/eligibility.plist" ]] && cp -n "/private/var/db/eligibilityd/eligibility.plist" "$BACKUP_DIR/eligibility.backup" 2>/dev/null || true
-  [[ -f "/private/var/db/os_eligibility/eligibility.plist" ]] && cp -n "/private/var/db/os_eligibility/eligibility.plist" "$BACKUP_DIR/os_eligibility.backup" 2>/dev/null || true
-  [[ -f "/private/var/db/com.apple.countryd/countryCodeCache.plist" ]] && cp -n "/private/var/db/com.apple.countryd/countryCodeCache.plist" "$BACKUP_DIR/countryCodeCache.backup" 2>/dev/null || true
+  [[ -f "$siri_pref" ]] && cp -n "$siri_pref" "$CURRENT_BACKUP_DIR/siri_pref.backup" 2>/dev/null || true
+  [[ -f "/private/var/db/eligibilityd/eligibility.plist" ]] && cp -n "/private/var/db/eligibilityd/eligibility.plist" "$CURRENT_BACKUP_DIR/eligibility.backup" 2>/dev/null || true
+  [[ -f "/private/var/db/os_eligibility/eligibility.plist" ]] && cp -n "/private/var/db/os_eligibility/eligibility.plist" "$CURRENT_BACKUP_DIR/os_eligibility.backup" 2>/dev/null || true
+  [[ -f "/private/var/db/com.apple.countryd/countryCodeCache.plist" ]] && cp -n "/private/var/db/com.apple.countryd/countryCodeCache.plist" "$CURRENT_BACKUP_DIR/countryCodeCache.backup" 2>/dev/null || true
 
   # Remove UI locks
   defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
   rm -f "$HOME/Library/Containers/com.apple.systempreferences.AppleIDSettings/Data/Library/Preferences/com.apple.assistant.backedup.plist" 2>/dev/null || true
   
-  # Clear eligibility cache
+  # Clear eligibility cache so macOS rebuilds it natively
   chflags nouchg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
   rm -f /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
   chflags nouchg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
@@ -256,8 +261,7 @@ modify_system_volume() {
   # Step 8: Edit the plist using Python
   if [[ -f "$PLIST_PATH" ]]; then
     echo "Found GenerativeModels.plist. Backing up and editing..."
-    mkdir -p "$BACKUP_DIR"
-    cp "$PLIST_PATH" "$BACKUP_DIR/GenerativeModels.plist.backup"
+    cp -n "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup" 2>/dev/null || true
     
     local patcher="$(mktemp)"
     cat > "$patcher" <<'PY'
@@ -302,45 +306,62 @@ uninstall() {
   section "Apple Intelligence Uninstall / Restore"
   check_security_status
   
-  clean_previous_configurations
-  
-  echo "Unloading and removing CodexRegionSpoof.kext..."
+  # Find the absolute latest backup directory
+  LATEST_BACKUP=""
+  if [[ -d "$BACKUP_BASE" ]]; then
+    LATEST_BACKUP=$(ls -td "$BACKUP_BASE"/*/ 2>/dev/null | head -1 || true)
+  fi
+
+  # Unload and remove Kext and Daemons first
+  echo "Unloading and removing CodexRegionSpoof.kext and Daemons..."
   if [[ -d "$KEXT" ]]; then
     kmutil unload -p "$KEXT" 2>/dev/null || true
     rm -rf "$KEXT"
   fi
+  launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
+  rm -f "$LOADER_PLIST" "$LOADER_SCRIPT" 2>/dev/null || true
+  
+  # Clear existing forced files so we don't leave corrupt data behind if no backup exists
+  defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
+  chflags nouchg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
+  rm -f /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
+  chflags nouchg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
+  rm -f /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
 
-  # Restore cached plists
-  echo "Restoring previous preferences and caches..."
-  local siri_pref="$HOME/Library/Preferences/com.apple.assistant.backedup.plist"
-  [[ -f "$BACKUP_DIR/siri_pref.backup" ]] && cp "$BACKUP_DIR/siri_pref.backup" "$siri_pref" && chown $(stat -f "%Su" "$HOME") "$siri_pref" 2>/dev/null || true
-  [[ -f "$BACKUP_DIR/eligibility.backup" ]] && cp "$BACKUP_DIR/eligibility.backup" "/private/var/db/eligibilityd/eligibility.plist" 2>/dev/null || true
-  [[ -f "$BACKUP_DIR/os_eligibility.backup" ]] && cp "$BACKUP_DIR/os_eligibility.backup" "/private/var/db/os_eligibility/eligibility.plist" 2>/dev/null || true
-  [[ -f "$BACKUP_DIR/countryCodeCache.backup" ]] && cp "$BACKUP_DIR/countryCodeCache.backup" "/private/var/db/com.apple.countryd/countryCodeCache.plist" 2>/dev/null || true
+  if [[ -n "$LATEST_BACKUP" ]]; then
+    echo "Restoring previous preferences and caches from: $LATEST_BACKUP"
+    local siri_pref="$HOME/Library/Preferences/com.apple.assistant.backedup.plist"
+    [[ -f "$LATEST_BACKUP/siri_pref.backup" ]] && cp "$LATEST_BACKUP/siri_pref.backup" "$siri_pref" && chown $(stat -f "%Su" "$HOME") "$siri_pref" 2>/dev/null || true
+    [[ -f "$LATEST_BACKUP/eligibility.backup" ]] && cp "$LATEST_BACKUP/eligibility.backup" "/private/var/db/eligibilityd/eligibility.plist" 2>/dev/null || true
+    [[ -f "$LATEST_BACKUP/os_eligibility.backup" ]] && cp "$LATEST_BACKUP/os_eligibility.backup" "/private/var/db/os_eligibility/eligibility.plist" 2>/dev/null || true
+    [[ -f "$LATEST_BACKUP/countryCodeCache.backup" ]] && cp "$LATEST_BACKUP/countryCodeCache.backup" "/private/var/db/com.apple.countryd/countryCodeCache.plist" 2>/dev/null || true
 
-  # Restore System Volume modification if backup exists
-  if [[ -f "$BACKUP_DIR/GenerativeModels.plist.backup" ]]; then
-    section "Restoring System Volume..."
-    local root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
-    local sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
-    
-    mkdir -p "$MOUNT_POINT"
-    mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT"
-    
-    echo "Restoring original GenerativeModels.plist..."
-    cp "$BACKUP_DIR/GenerativeModels.plist.backup" "$PLIST_PATH"
-    chown root:wheel "$PLIST_PATH"
-    chmod 0644 "$PLIST_PATH"
-    
-    echo "Creating new restored boot snapshot..."
-    bless --mount "$MOUNT_POINT" --bootefi --create-snapshot
-    rm -rf "$BACKUP_DIR"
-    echo "System volume restored."
+    # Restore System Volume modification if backup exists
+    if [[ -f "$LATEST_BACKUP/GenerativeModels.plist.backup" ]]; then
+      section "Restoring System Volume..."
+      local root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
+      local sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+      
+      mkdir -p "$MOUNT_POINT"
+      mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT"
+      
+      echo "Restoring original GenerativeModels.plist..."
+      cp "$LATEST_BACKUP/GenerativeModels.plist.backup" "$PLIST_PATH"
+      chown root:wheel "$PLIST_PATH"
+      chmod 0644 "$PLIST_PATH"
+      
+      echo "Creating new restored boot snapshot..."
+      bless --mount "$MOUNT_POINT" --bootefi --create-snapshot
+      echo "System volume restored."
+    else
+      echo "No GenerativeModels.plist backup found. Skipping System volume restore."
+    fi
   else
-    echo "No GenerativeModels.plist backup found. Skipping System volume restore."
+    echo "No backup directory found! Skipping file restoration."
   fi
 
   section "Uninstall Complete"
+  echo "Note: The backup folder ($BACKUP_BASE) was intentionally kept."
   echo "Reboot your Mac for all changes to take effect and to boot into the restored snapshot."
   exit 0
 }
@@ -363,7 +384,7 @@ modify_system_volume
 
 section "Installation Complete!"
 echo "The script has successfully:"
-echo "1. Cleared old configuration caches."
+echo "1. Backed up and cleared old configuration caches."
 echo "2. Installed the secure hardware spoofer."
 if [[ "$SKIP_LOCATION_SPOOF" -eq 1 ]]; then
   echo "3. Skipped Location/Geo spoofing (as requested by flag)."
