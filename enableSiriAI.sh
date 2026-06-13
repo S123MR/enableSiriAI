@@ -337,11 +337,18 @@ apply_generative_models_patch() {
       /usr/libexec/PlistBuddy -c "Save" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to create Override Plist."; exit 1; }
     fi
     
-    # Safe PlistBuddy Modification Logic (No error masking)
-    if /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist" "$OVERRIDE_PLIST" >/dev/null 2>&1; then
+    # Ensure dict exists
+    if ! /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist" "$OVERRIDE_PLIST" >/dev/null 2>&1; then
+      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to Add dictionary."; exit 1; }
+    fi
+    
+    # Remove DevelopmentPhase if it exists, leaving the rest of the plist entirely untouched
+    /usr/libexec/PlistBuddy -c "Delete :EnhancedSiriWaitlist:DevelopmentPhase" "$OVERRIDE_PLIST" 2>/dev/null || true
+    
+    # Set or Add Enabled flag
+    if /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist:Enabled" "$OVERRIDE_PLIST" >/dev/null 2>&1; then
       /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to Set Enabled flag."; exit 1; }
     else
-      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to Add dictionary."; exit 1; }
       /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to Add Enabled flag."; exit 1; }
     fi
     
@@ -352,8 +359,6 @@ apply_generative_models_patch() {
   else
     section "Mounting & Editing Sealed System Volume"
     
-    # APFS Device Parsing Logic
-    # 1. Grab the exact snapshot device string currently mounted at / (e.g., /dev/disk3s1s1)
     local root_dev
     root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
     if [[ -z "$root_dev" ]]; then
@@ -391,11 +396,18 @@ apply_generative_models_patch() {
       echo "Found GenerativeModels.plist. Backing up and editing..."
       cp "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup"
       
-      # Safe PlistBuddy Modification Logic (No error masking)
-      if /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist" "$PLIST_PATH" >/dev/null 2>&1; then
+      # Ensure dict exists
+      if ! /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist" "$PLIST_PATH" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" || { echo "Fatal Error: Failed to Add dictionary."; exit 1; }
+      fi
+      
+      # Remove DevelopmentPhase if it exists, leaving the rest of the plist entirely untouched
+      /usr/libexec/PlistBuddy -c "Delete :EnhancedSiriWaitlist:DevelopmentPhase" "$PLIST_PATH" 2>/dev/null || true
+      
+      # Set or Add Enabled flag
+      if /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist:Enabled" "$PLIST_PATH" >/dev/null 2>&1; then
         /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH" || { echo "Fatal Error: Failed to Set Enabled flag."; exit 1; }
       else
-        /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" || { echo "Fatal Error: Failed to Add dictionary."; exit 1; }
         /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$PLIST_PATH" || { echo "Fatal Error: Failed to Add Enabled flag."; exit 1; }
       fi
       
