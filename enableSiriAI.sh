@@ -68,7 +68,7 @@ section() {
   echo "== $1 =="
 }
 
-# --- 1. Sudo Escalation (Must be first, array expansion safely handled) ---
+# --- 1. Sudo Escalation ---
 if [[ $EUID -ne 0 && "$DO_VERIFY_ONLY" -eq 0 ]]; then
   echo "Administrative privileges required. Prompting for sudo..."
   if [[ ${#ORIG_ARGS[@]} -gt 0 ]]; then
@@ -78,7 +78,7 @@ if [[ $EUID -ne 0 && "$DO_VERIFY_ONLY" -eq 0 ]]; then
   fi
 fi
 
-# --- 2. Safe User Home Assignment (handles spaces) ---
+# --- 2. Safe User Home Assignment ---
 if [[ -n "${SUDO_USER:-}" ]]; then
   REAL_HOME=$(dscl . -read /Users/"$SUDO_USER" NFSHomeDirectory 2>/dev/null | sed 's/^[[:space:]]*NFSHomeDirectory:[[:space:]]*//' || true)
   [[ -z "$REAL_HOME" ]] && REAL_HOME="$HOME"
@@ -278,7 +278,6 @@ EOF
   <key>ProgramArguments</key>
   <array><string>${LOADER_SCRIPT}</string></array>
   <key>RunAtLoad</key><true/>
-  <key>LaunchOnlyOnce</key><true/>
   <key>StandardOutPath</key><string>/var/log/codex-region-spoof-loader.stdout.log</string>
   <key>StandardErrorPath</key><string>/var/log/codex-region-spoof-loader.stderr.log</string>
 </dict>
@@ -288,8 +287,15 @@ EOF
   rm -f "$tmp_plist"
 
   echo "Bootstrapping LaunchDaemon..."
+  # Pre-create logs to avoid launchd permission denials
+  touch /var/log/codex-region-spoof-loader.stdout.log /var/log/codex-region-spoof-loader.stderr.log
+  chmod 644 /var/log/codex-region-spoof-loader.*
+
   launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
+  launchctl enable system/local.codex.region-spoof-loader 2>/dev/null || true
   launchctl bootstrap system "$LOADER_PLIST" || { echo "Fatal Error: Failed to bootstrap LaunchDaemon"; exit 1; }
+  
+  sleep 1
   launchctl kickstart -k system/local.codex.region-spoof-loader || { echo "Fatal Error: Failed to kickstart LaunchDaemon"; exit 1; }
 }
 
@@ -367,7 +373,6 @@ uninstall() {
   local OLDEST_BACKUP=""
   
   if [[ -d "$BACKUP_BASE" ]]; then
-    # Use latest backup for caching/preferences, but oldest backup for pristine system files
     LATEST_BACKUP=$(ls -td "$BACKUP_BASE"/*/ 2>/dev/null | head -1 || true)
     OLDEST_BACKUP=$(ls -td "$BACKUP_BASE"/*/ 2>/dev/null | tail -1 || true)
   fi
@@ -412,7 +417,6 @@ uninstall() {
        chmod 0644 "$OVERRIDE_PLIST"
     fi
 
-    # System file restoration (Uses OLDEST_BACKUP to prevent double-run tamper restores)
     if [[ -n "$OLDEST_BACKUP" && -f "$OLDEST_BACKUP/GenerativeModels.plist.backup" ]]; then
       section "Restoring System Volume (From pristine backup: $OLDEST_BACKUP)..."
       local root_dev
