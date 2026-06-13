@@ -37,7 +37,7 @@ ORIG_ARGS=("$@")
 cleanup() {
   if mount | grep -q " on $MOUNT_POINT "; then
     echo "Cleaning up: Unmounting $MOUNT_POINT..."
-    diskutil unmount force "$MOUNT_POINT" 2>/dev/null || umount "$MOUNT_POINT" 2>/dev/null || true
+    diskutil unmount force "$MOUNT_POINT" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT INT TERM
@@ -157,8 +157,10 @@ clean_previous_configurations() {
   section "Cleaning previous configurations & caches"
   mkdir -p "$CURRENT_BACKUP_DIR"
 
-  # Unload daemons safely
-  launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
+  # Safely unload daemons by checking if they exist in the domain first
+  if launchctl print system/local.codex.region-spoof-loader >/dev/null 2>&1; then
+    launchctl bootout system "$LOADER_PLIST" || echo "Warning: Failed to bootout existing daemon"
+  fi
   rm -f "$LOADER_PLIST" "$LOADER_SCRIPT"
   
   # Strict backups
@@ -173,15 +175,25 @@ clean_previous_configurations() {
   rm -f "$REAL_HOME/Library/Containers/com.apple.systempreferences.AppleIDSettings/Data/Library/Preferences/com.apple.assistant.backedup.plist"
   killall cfprefsd 2>/dev/null || true
   
-  # Clear cache files
-  chflags nouchg,noschg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/eligibilityd/eligibility.plist
-  chflags nouchg,noschg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/os_eligibility/eligibility.plist
+  # Clear cache files cleanly without masking errors.
+  # If the file exists, chflags and rm MUST succeed.
+  local elig_file="/private/var/db/eligibilityd/eligibility.plist"
+  if [[ -f "$elig_file" ]]; then
+    chflags nouchg,noschg "$elig_file"
+    rm -f "$elig_file"
+  fi
+  
+  local os_elig_file="/private/var/db/os_eligibility/eligibility.plist"
+  if [[ -f "$os_elig_file" ]]; then
+    chflags nouchg,noschg "$os_elig_file"
+    rm -f "$os_elig_file"
+  fi
 
-  # Unlock countryd cache
-  chflags nouchg,noschg /private/var/db/com.apple.countryd/countryCodeCache.plist 2>/dev/null || true
-  chmod 0644 /private/var/db/com.apple.countryd/countryCodeCache.plist 2>/dev/null || true
+  local country_cache="/private/var/db/com.apple.countryd/countryCodeCache.plist"
+  if [[ -f "$country_cache" ]]; then
+    chflags nouchg,noschg "$country_cache"
+    chmod 0644 "$country_cache"
+  fi
 }
 
 ensure_region_spoof_kext_installed() {
@@ -193,13 +205,24 @@ ensure_region_spoof_kext_installed() {
   fi
 
   if [[ ! -d "$LOCAL_KEXT" ]]; then
-    echo "Error: Missing local bundle $LOCAL_KEXT" >&2
+    echo "Fatal Error: Missing local bundle $LOCAL_KEXT" >&2
     exit 1
+  fi
+
+  local macos_dir="$(dirname "$LOCAL_KEXT_BIN")"
+  if [[ ! -d "$macos_dir" ]]; then
+    mkdir -p "$macos_dir"
   fi
 
   if [[ ! -x "$LOCAL_KEXT_BIN" && -f "$LOCAL_KEXT_BIN_B64" ]]; then
     /usr/bin/base64 -D -i "$LOCAL_KEXT_BIN_B64" -o "$LOCAL_KEXT_BIN" || { echo "Fatal Error: Kext payload decoding failed."; exit 1; }
     chmod 755 "$LOCAL_KEXT_BIN"
+  fi
+
+  # Binary Validation
+  if ! file "$LOCAL_KEXT_BIN" | grep -q "Mach-O"; then
+    echo "Fatal Error: Decoded kext binary is not a valid Mach-O executable." >&2
+    exit 1
   fi
 
   cp -R "$LOCAL_KEXT" "$KEXT"
@@ -228,8 +251,11 @@ EOF
 
   if [[ "$SKIP_LOCATION_SPOOF" -eq 0 ]]; then
     cat >> "$tmp_script" <<'EOF'
-  GEO_PLIST="/var/db/locationd/Library/Caches/GeoServices/DirectReadConfigStore.plist"
-  /bin/mkdir -p /var/db/locationd/Library/Caches/GeoServices
+  GEO_DIR="/var/db/locationd/Library/Caches/GeoServices"
+  GEO_PLIST="$GEO_DIR/DirectReadConfigStore.plist"
+  
+  /bin/mkdir -p "$GEO_DIR"
+  /usr/sbin/chown -R _locationd:_locationd "$GEO_DIR"
   
   cat > "$GEO_PLIST" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -287,12 +313,11 @@ EOF
   rm -f "$tmp_plist"
 
   echo "Bootstrapping LaunchDaemon..."
-  # Pre-create logs to avoid launchd permission denials
   touch /var/log/codex-region-spoof-loader.stdout.log /var/log/codex-region-spoof-loader.stderr.log
   chmod 644 /var/log/codex-region-spoof-loader.*
 
-  launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
-  launchctl enable system/local.codex.region-spoof-loader 2>/dev/null || true
+  # Strictly enforce enable and bootstrap
+  launchctl enable system/local.codex.region-spoof-loader || { echo "Fatal Error: Failed to enable LaunchDaemon"; exit 1; }
   launchctl bootstrap system "$LOADER_PLIST" || { echo "Fatal Error: Failed to bootstrap LaunchDaemon"; exit 1; }
   
   sleep 1
@@ -308,11 +333,17 @@ apply_generative_models_patch() {
       cp "$OVERRIDE_PLIST" "$CURRENT_BACKUP_DIR/GenerativeModels_Override.plist.backup"
     fi
     
-    /usr/libexec/PlistBuddy -c "Clear dict" "$OVERRIDE_PLIST" 2>/dev/null || true
-    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$OVERRIDE_PLIST" 2>/dev/null || true
-    /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$OVERRIDE_PLIST" 2>/dev/null || \
-    /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$OVERRIDE_PLIST" || \
-    { echo "Fatal Error: PlistBuddy failed to modify the safe override plist."; exit 1; }
+    if [[ ! -f "$OVERRIDE_PLIST" ]]; then
+      /usr/libexec/PlistBuddy -c "Save" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to create Override Plist."; exit 1; }
+    fi
+    
+    # Safe PlistBuddy Modification Logic (No error masking)
+    if /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist" "$OVERRIDE_PLIST" >/dev/null 2>&1; then
+      /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to Set Enabled flag."; exit 1; }
+    else
+      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to Add dictionary."; exit 1; }
+      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$OVERRIDE_PLIST" || { echo "Fatal Error: Failed to Add Enabled flag."; exit 1; }
+    fi
     
     chown root:wheel "$OVERRIDE_PLIST"
     chmod 0644 "$OVERRIDE_PLIST"
@@ -321,6 +352,8 @@ apply_generative_models_patch() {
   else
     section "Mounting & Editing Sealed System Volume"
     
+    # APFS Device Parsing Logic
+    # 1. Grab the exact snapshot device string currently mounted at / (e.g., /dev/disk3s1s1)
     local root_dev
     root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
     if [[ -z "$root_dev" ]]; then
@@ -328,8 +361,15 @@ apply_generative_models_patch() {
       exit 1
     fi
     
+    # 2. Strip the final snapshot identifier using regex (s[0-9]+$) to get the physical volume (e.g., /dev/disk3s1)
     local sys_dev
-    sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+    sys_dev="$(echo "$root_dev" | sed -E 's/s[0-9]+$//')"
+    
+    if [[ "$sys_dev" == "$root_dev" ]]; then
+      echo "Fatal Error: Root device ($root_dev) is not recognized as a standard APFS snapshot. Aborting for safety." >&2
+      exit 1
+    fi
+    
     if [[ ! -b "$sys_dev" ]]; then
       echo "Fatal Error: Parsed device $sys_dev is not a valid block device." >&2
       exit 1
@@ -341,14 +381,23 @@ apply_generative_models_patch() {
     echo "Mounting $sys_dev to $MOUNT_POINT (Read/Write)..."
     mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT" || { echo "Fatal Error: Failed to mount System Volume."; exit 1; }
 
+    # Verification checkpoint
+    if [[ ! -d "$MOUNT_POINT/System/Library" ]]; then
+      echo "Fatal Error: Mounted volume does not contain a macOS System folder. Aborting." >&2
+      exit 1
+    fi
+
     if [[ -f "$PLIST_PATH" ]]; then
       echo "Found GenerativeModels.plist. Backing up and editing..."
       cp "$PLIST_PATH" "$CURRENT_BACKUP_DIR/GenerativeModels.plist.backup"
       
-      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" 2>/dev/null || true
-      /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$PLIST_PATH" 2>/dev/null || \
-      /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH" || \
-      { echo "Fatal Error: PlistBuddy failed to modify the plist."; exit 1; }
+      # Safe PlistBuddy Modification Logic (No error masking)
+      if /usr/libexec/PlistBuddy -c "Print :EnhancedSiriWaitlist" "$PLIST_PATH" >/dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c "Set :EnhancedSiriWaitlist:Enabled false" "$PLIST_PATH" || { echo "Fatal Error: Failed to Set Enabled flag."; exit 1; }
+      else
+        /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist dict" "$PLIST_PATH" || { echo "Fatal Error: Failed to Add dictionary."; exit 1; }
+        /usr/libexec/PlistBuddy -c "Add :EnhancedSiriWaitlist:Enabled bool false" "$PLIST_PATH" || { echo "Fatal Error: Failed to Add Enabled flag."; exit 1; }
+      fi
       
       chown root:wheel "$PLIST_PATH"
       chmod 0644 "$PLIST_PATH"
@@ -361,7 +410,7 @@ apply_generative_models_patch() {
     bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
     
     echo "Snapshot created successfully!"
-    diskutil unmount force "$MOUNT_POINT" 2>/dev/null || umount "$MOUNT_POINT" 2>/dev/null || true
+    diskutil unmount force "$MOUNT_POINT" >/dev/null 2>&1 || true
   fi
 }
 
@@ -382,16 +431,26 @@ uninstall() {
     kmutil unload -p "$KEXT" 2>/dev/null || true
     rm -rf "$KEXT"
   fi
-  launchctl bootout system "$LOADER_PLIST" 2>/dev/null || true
+  
+  if launchctl print system/local.codex.region-spoof-loader >/dev/null 2>&1; then
+    launchctl bootout system "$LOADER_PLIST" || echo "Warning: Failed to bootout existing daemon"
+  fi
   rm -f "$LOADER_PLIST" "$LOADER_SCRIPT"
   
   sudo -u "${SUDO_USER:-$USER}" defaults delete com.apple.assistant.backedup SiriAvailability 2>/dev/null || true
   killall cfprefsd 2>/dev/null || true
   
-  chflags nouchg,noschg /private/var/db/eligibilityd/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/eligibilityd/eligibility.plist
-  chflags nouchg,noschg /private/var/db/os_eligibility/eligibility.plist 2>/dev/null || true
-  rm -f /private/var/db/os_eligibility/eligibility.plist
+  local elig_file="/private/var/db/eligibilityd/eligibility.plist"
+  if [[ -f "$elig_file" ]]; then
+    chflags nouchg,noschg "$elig_file"
+    rm -f "$elig_file"
+  fi
+  
+  local os_elig_file="/private/var/db/os_eligibility/eligibility.plist"
+  if [[ -f "$os_elig_file" ]]; then
+    chflags nouchg,noschg "$os_elig_file"
+    rm -f "$os_elig_file"
+  fi
 
   if [[ -f "$OVERRIDE_PLIST" ]]; then
     echo "Removing Safe FeatureFlag Override..."
@@ -404,7 +463,7 @@ uninstall() {
     
     if [[ -f "$LATEST_BACKUP/siri_pref.backup" ]]; then
       cp "$LATEST_BACKUP/siri_pref.backup" "$siri_pref"
-      chown $(stat -f "%Su" "$REAL_HOME") "$siri_pref"
+      chown "$(stat -f "%Su" "$REAL_HOME")" "$siri_pref"
     fi
     if [[ -f "$LATEST_BACKUP/eligibility.backup" ]]; then cp "$LATEST_BACKUP/eligibility.backup" "/private/var/db/eligibilityd/eligibility.plist"; fi
     if [[ -f "$LATEST_BACKUP/os_eligibility.backup" ]]; then cp "$LATEST_BACKUP/os_eligibility.backup" "/private/var/db/os_eligibility/eligibility.plist"; fi
@@ -422,7 +481,12 @@ uninstall() {
       local root_dev
       root_dev="$(mount | awk '$3 == "/" {print $1; exit}')"
       local sys_dev
-      sys_dev="$(echo "$root_dev" | sed -E 's/(s[0-9]+)s[0-9]+$/\1/')"
+      sys_dev="$(echo "$root_dev" | sed -E 's/s[0-9]+$//')"
+      
+      if [[ "$sys_dev" == "$root_dev" ]]; then
+        echo "Fatal Error: Root device ($root_dev) is not recognized as a standard APFS snapshot." >&2
+        exit 1
+      fi
       if [[ ! -b "$sys_dev" ]]; then
         echo "Fatal Error: Parsed device $sys_dev is not a valid block device." >&2
         exit 1
@@ -430,6 +494,11 @@ uninstall() {
       
       mkdir -p "$MOUNT_POINT"
       mount -o nobrowse -t apfs "$sys_dev" "$MOUNT_POINT" || { echo "Fatal Error: Failed to mount System Volume."; exit 1; }
+      
+      if [[ ! -d "$MOUNT_POINT/System/Library" ]]; then
+        echo "Fatal Error: Mounted volume does not contain a macOS System folder. Aborting." >&2
+        exit 1
+      fi
       
       echo "Restoring original GenerativeModels.plist..."
       cp "$OLDEST_BACKUP/GenerativeModels.plist.backup" "$PLIST_PATH"
@@ -439,7 +508,7 @@ uninstall() {
       echo "Creating new restored boot snapshot..."
       bless --mount "$MOUNT_POINT" --bootefi --create-snapshot || { echo "Fatal Error: Failed to bless snapshot."; exit 1; }
       
-      diskutil unmount force "$MOUNT_POINT" 2>/dev/null || umount "$MOUNT_POINT" 2>/dev/null || true
+      diskutil unmount force "$MOUNT_POINT" >/dev/null 2>&1 || true
       echo "System volume restored."
     else
       echo "No GenerativeModels.plist pristine backup found. Skipping System volume restore."
