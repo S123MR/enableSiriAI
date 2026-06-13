@@ -1,6 +1,6 @@
 # enableSiriAI
 
-A small macOS utility to enable Apple Intelligence / enhanced Siri features.
+A small macOS utility to the new Siri AI features on macOS 27.
 
 > WARNING: This tool performs low-level system changes, including writing to the sealed System volume, installing a custom kernel extension, and may require disabling SIP/Authenticated Root. Use at your own risk.
 
