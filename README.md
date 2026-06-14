@@ -2,25 +2,24 @@
 
 A small macOS utility to the new Siri AI features on macOS 27.
 
-> WARNING: This tool performs low-level system changes, including writing to the sealed System volume, installing a custom kernel extension, and may require disabling SIP/Authenticated Root. Use at your own risk.
+> WARNING: This tool performs low-level system changes and installs a custom kernel extension. By default (with `--safe-override`), it does not require disabling Authenticated Root or file vault. Without the flag, it will write to the sealed System volume and require disabling these protections. Use at your own risk.
 
 ## Requirements
 
 - Administrative access (`sudo`) to run the script
-- System Integrity Protection (SIP) and Authenticated Root needs to be disabled for the script to work
-- After successful installation, you can re-enable parts of SIP for more protection with:
-
-```zsh
-csrutil enable --without kext
-```
-
-- Do not re-enable authenticated-root. In some circumstances, re-enabling FileVault is also doable.
+- **With `--safe-override` (recommended):** No additional requirements; SIP needs to be disabled and Authenticated Root can remain enabled
+  - **Without `--safe-override`:** System Integrity Protection (SIP) and Authenticated Root need to be disabled
+    - Do not re-enable authenticated-root. In some circumstances, re-enabling FileVault is also doable.
+  - After successful installation, you can re-enable parts of SIP for more protection with:
+  ```zsh
+  csrutil enable --without kext
+  ```
 
 ## Before you begin
 
 1. It's recommended to back up your Mac and important data.
-2. If SIP or Authenticated Root is enabled, disabe them before use.
-3. Know how to boot into recovery
+2. For the recommended `--safe-override` method, you will only need to disable SIP.
+3. If using the script without `--safe-override`, you will need to disable SIP and Authenticated Root before use, and know how to boot into recovery.
 
 ## Usage
 
@@ -58,6 +57,8 @@ cd /path/to/enableSIriAI
 
 ## Recommended workflow
 
+**Default (Recommended) - No authenticated root required:**
+
 1. Confirm your Mac is backed up.
 2. Open Terminal.
 3. Navigate to the repository:
@@ -67,25 +68,29 @@ cd /Users/yourname/Downloads/enableSIriAI
 ```
 (or the place where your saved repo is)
 
-4. Run the installer:
-
-```zsh
-./enableSiriAI.sh
-```
-
-4. If you want to keep hardware spoofing only, run:
-
-```zsh
-./enableSiriAI.sh --skip-location-spoof
-```
-
-5. To use a local feature override instead of modifying the sealed APFS snapshot, run:
+4. Run the installer with `--safe-override` (uses local override instead of modifying sealed APFS snapshot):
 
 ```zsh
 ./enableSiriAI.sh --safe-override
 ```
 
-6. Reboot after the script completes.
+5. Reboot after the script completes.
+
+**Alternative - Full system modification (requires disabling SIP/Authenticated Root):**
+
+If you prefer to modify the sealed APFS system snapshot instead, first disable SIP and Authenticated Root, then run:
+
+```zsh
+./enableSiriAI.sh
+```
+
+**Optional flags:**
+
+- Add `--skip-location-spoof` to any command if you want to keep hardware spoofing only:
+
+```zsh
+./enableSiriAI.sh --safe-override --skip-location-spoof
+```
 
 ## Uninstall
 
