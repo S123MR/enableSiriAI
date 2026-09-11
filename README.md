@@ -1,4 +1,4 @@
-# enableSiriAI
+# enableSiriAI (tested working on macOS 27 Golden Gate official release)
 
 A small macOS utility to the new Siri AI features on macOS 27.
 
